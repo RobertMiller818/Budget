@@ -659,12 +659,28 @@ function generateInsights(transactions, cards, subscriptions, bills) {
         metricLabel: `${(topDiscretionary.pctOfExpenses * 100).toFixed(0)}% of expenses`,
         description: `${topDiscretionary.name} is your largest discretionary category at ${fmt(topDiscretionary.total / months)}/mo across ${topDiscretionary.count} transactions. A 30% reduction would save ${fmt((topDiscretionary.total / months) * 0.3)}/mo.`,
         savingsPotential: (topDiscretionary.total / months) * 0.3,
-        evidence: topDiscretionary,
         severity: topDiscretionary.pctOfExpenses > 0.25 ? "high" : topDiscretionary.pctOfExpenses > 0.15 ? "medium" : "low",
+        topTransactions: topDiscretionary.transactions
+          .sort((a, b) => a.amount - b.amount)
+          .slice(0, 10)
+          .map((t) => ({ date: t.date, description: t.description, amount: Math.abs(t.amount) })),
       }
     : null;
 
   // ── BEHAVIORAL INSIGHT 2: Peak spending day / impulse pattern ──
+  const peakDayName = temporalModel.peakDay.day;
+  const dayNames2 = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const peakDayIdx = dayNames2.indexOf(peakDayName);
+  const peakDayTxns = transactions
+    .filter((t) => {
+      if (t.amount >= 0) return false;
+      const d = new Date(t.date);
+      return !isNaN(d) && d.getDay() === peakDayIdx;
+    })
+    .sort((a, b) => a.amount - b.amount)
+    .slice(0, 10)
+    .map((t) => ({ date: t.date, description: t.description, amount: Math.abs(t.amount) }));
+
   const behavioral2 = {
     title: `${temporalModel.peakDay.day} spending spikes`,
     icon: "📅",
@@ -673,12 +689,19 @@ function generateInsights(transactions, cards, subscriptions, bills) {
     description: `You spend ${fmt(temporalModel.peakDay.total)} on ${temporalModel.peakDay.day}s — ${((temporalModel.peakDay.total / (temporalModel.dayData.reduce((s, d) => s + d.total, 0) || 1)) * 100).toFixed(0)}% of all spending on one day. ${temporalModel.peakDay.day}s average ${fmt(temporalModel.peakDay.avg)} per transaction vs ${fmt(temporalModel.calmDay.avg)} on ${temporalModel.calmDay.day}s. Setting a daily cap on ${temporalModel.peakDay.day}s could save ${fmt(temporalModel.peakDay.total * 0.25)}.`,
     savingsPotential: temporalModel.peakDay.total * 0.25,
     severity: temporalModel.peakDay.total / (temporalModel.avgDailyTotal || 1) > 1.5 ? "high" : "medium",
+    topTransactions: peakDayTxns,
   };
 
   // ── BEHAVIORAL INSIGHT 3: Merchant habit & small purchase accumulation ──
   const topHabitMerchant = merchantModel.merchants.find(
     (m) => m.count >= 3 && m.avg < 50
   );
+  const smallPurchases = transactions
+    .filter((t) => t.amount < 0 && Math.abs(t.amount) < 25)
+    .sort((a, b) => a.amount - b.amount)
+    .slice(0, 10)
+    .map((t) => ({ date: t.date, description: t.description, amount: Math.abs(t.amount) }));
+
   const behavioral3 = {
     title: "Small purchase accumulation",
     icon: "🛒",
@@ -690,6 +713,7 @@ function generateInsights(transactions, cards, subscriptions, bills) {
     savingsPotential: topHabitMerchant ? topHabitMerchant.savingsIfHalved : temporalModel.smallTxnTotal * 0.3,
     severity: temporalModel.impulseRatio > 0.1 ? "medium" : "low",
     topMerchants: merchantModel.merchants.slice(0, 5),
+    topTransactions: smallPurchases,
   };
 
   // ── DEBT STRATEGY 1: Avalanche vs Snowball comparison ──
@@ -1310,6 +1334,32 @@ export default function FinancialPlanner() {
                                           <span className="text-red-600">{fmt(m.total)}</span>
                                         </span>
                                       ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* Top 10 transactions for this insight */}
+                                {insight.topTransactions && insight.topTransactions.length > 0 && (
+                                  <div className="mt-3 pt-3 border-t border-gray-100">
+                                    <div className="text-xs font-medium text-gray-500 mb-2">Top 10 expenses in this category:</div>
+                                    <div className="space-y-1">
+                                      {insight.topTransactions.map((t, j) => {
+                                        const maxAmt = insight.topTransactions[0]?.amount || 1;
+                                        const barW = (t.amount / maxAmt) * 100;
+                                        return (
+                                          <div key={j} className="flex items-center gap-2 py-1">
+                                            <span className="text-xs text-gray-400 w-4 text-right flex-shrink-0">{j + 1}</span>
+                                            <span className="text-xs text-gray-400 w-20 flex-shrink-0">{t.date}</span>
+                                            <div className="flex-1 min-w-0">
+                                              <div className="text-xs text-gray-700 truncate">{t.description}</div>
+                                              <div className="h-1 rounded-full bg-gray-100 mt-0.5 overflow-hidden" style={{ maxWidth: 220 }}>
+                                                <div className="h-full rounded-full" style={{ width: `${barW}%`, background: "linear-gradient(90deg, #ef4444, #fca5a5)" }} />
+                                              </div>
+                                            </div>
+                                            <span className="text-xs font-semibold text-red-600 w-16 text-right flex-shrink-0">{fmt(t.amount)}</span>
+                                          </div>
+                                        );
+                                      })}
                                     </div>
                                   </div>
                                 )}
