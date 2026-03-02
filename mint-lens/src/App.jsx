@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 const fmt = (n) =>
@@ -278,8 +278,10 @@ function buildBudget(transactions) {
   transactions.forEach((t) => {
     const mK = getMonthKey(t.date), wK = getWeekKey(t.date);
     if (!mK) return;
-    if (!monthly[mK]) monthly[mK] = { income: 0, expenses: 0 };
-    if (wK && !weekly[wK]) weekly[wK] = { income: 0, expenses: 0 };
+    if (!monthly[mK]) monthly[mK] = { income: 0, expenses: 0, transactions: [] };
+    if (wK && !weekly[wK]) weekly[wK] = { income: 0, expenses: 0, transactions: [] };
+    monthly[mK].transactions.push(t);
+    if (wK) weekly[wK].transactions.push(t);
     if (t.amount >= 0) {
       monthly[mK].income += t.amount;
       if (wK) weekly[wK].income += t.amount;
@@ -289,6 +291,13 @@ function buildBudget(transactions) {
     }
   });
   return { monthly, weekly };
+}
+
+function getTopExpenses(transactions, limit = 10) {
+  return transactions
+    .filter((t) => t.amount < 0)
+    .sort((a, b) => a.amount - b.amount)
+    .slice(0, limit);
 }
 
 // ─── Debt Payoff (Avalanche) ────────────────────────────────────────────────
@@ -341,6 +350,7 @@ export default function FinancialPlanner() {
   const [cardForm, setCardForm] = useState({ name: "", balance: "", interest: "", payment: "" });
   const [budgetView, setBudgetView] = useState("monthly");
   const [parseLog, setParseLog] = useState([]);
+  const [expandedPeriods, setExpandedPeriods] = useState(new Set());
 
   const { subscriptions, bills } = useMemo(() => detectRecurring(transactions), [transactions]);
   const budget = useMemo(() => buildBudget(transactions), [transactions]);
@@ -674,11 +684,11 @@ export default function FinancialPlanner() {
               <div className="flex items-end justify-between">
                 <div>
                   <h2 style={{ fontFamily: "'Fraunces', serif", fontSize: "1.6rem", fontWeight: 600, color: "#1a1a1a", marginBottom: 4 }}>Budget Overview</h2>
-                  <p className="text-sm text-gray-500">Income vs. expenses by period.</p>
+                  <p className="text-sm text-gray-500">Income vs. expenses by period. Click any row to see top expenses.</p>
                 </div>
                 <div className="flex rounded-lg overflow-hidden border border-gray-200">
                   {["monthly", "weekly"].map((v) => (
-                    <button key={v} onClick={() => setBudgetView(v)} className="px-4 py-1.5 text-xs font-medium capitalize transition-colors"
+                    <button key={v} onClick={() => { setBudgetView(v); setExpandedPeriods(new Set()); }} className="px-4 py-1.5 text-xs font-medium capitalize transition-colors"
                       style={{ background: budgetView === v ? "#1a7a5c" : "white", color: budgetView === v ? "white" : "#6b7280" }}>{v}</button>
                   ))}
                 </div>
@@ -692,6 +702,14 @@ export default function FinancialPlanner() {
                 const totalExpenses = entries.reduce((s, [, v]) => s + v.expenses, 0);
                 const net = totalIncome - totalExpenses;
                 const committed = totalBillMonthly + totalSubMonthly;
+                const togglePeriod = (period) => {
+                  setExpandedPeriods((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(period)) next.delete(period);
+                    else next.add(period);
+                    return next;
+                  });
+                };
                 return (<>
                   <div className="grid grid-cols-4 gap-3">
                     <StatCard label="Total Income" value={fmt(totalIncome)} color="#059669" />
@@ -712,19 +730,64 @@ export default function FinancialPlanner() {
                         {entries.map(([period, v]) => {
                           const n = v.income - v.expenses;
                           const mx = Math.max(...entries.map(([, e]) => Math.max(e.income, e.expenses))) || 1;
+                          const isExpanded = expandedPeriods.has(period);
+                          const topExpenses = isExpanded ? getTopExpenses(v.transactions, 10) : [];
                           return (
-                            <tr key={period} className="border-t border-gray-100 hover:bg-gray-50 transition-colors">
-                              <td className="px-4 py-3 font-medium text-gray-800">{period}</td>
-                              <td className="px-4 py-3 text-right text-emerald-700">{fmt(v.income)}</td>
-                              <td className="px-4 py-3 text-right text-red-600">{fmt(v.expenses)}</td>
-                              <td className="px-4 py-3 text-right font-semibold" style={{ color: n >= 0 ? "#059669" : "#dc2626" }}>{fmt(n)}</td>
-                              <td className="px-4 py-3">
-                                <div className="flex flex-col gap-1">
-                                  <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden"><div className="h-full rounded-full" style={{ width: `${(v.income / mx) * 100}%`, background: "#34d399" }} /></div>
-                                  <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden"><div className="h-full rounded-full" style={{ width: `${(v.expenses / mx) * 100}%`, background: "#f87171" }} /></div>
-                                </div>
-                              </td>
-                            </tr>
+                            <React.Fragment key={period}>
+                              <tr
+                                className="border-t border-gray-100 hover:bg-gray-50 transition-colors cursor-pointer"
+                                onClick={() => togglePeriod(period)}
+                              >
+                                <td className="px-4 py-3 font-medium text-gray-800">
+                                  <span className="inline-block w-4 text-gray-400 text-xs mr-1" style={{ transition: "transform 0.2s", transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}>▶</span>
+                                  {period}
+                                </td>
+                                <td className="px-4 py-3 text-right text-emerald-700">{fmt(v.income)}</td>
+                                <td className="px-4 py-3 text-right text-red-600">{fmt(v.expenses)}</td>
+                                <td className="px-4 py-3 text-right font-semibold" style={{ color: n >= 0 ? "#059669" : "#dc2626" }}>{fmt(n)}</td>
+                                <td className="px-4 py-3">
+                                  <div className="flex flex-col gap-1">
+                                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden"><div className="h-full rounded-full" style={{ width: `${(v.income / mx) * 100}%`, background: "#34d399" }} /></div>
+                                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden"><div className="h-full rounded-full" style={{ width: `${(v.expenses / mx) * 100}%`, background: "#f87171" }} /></div>
+                                  </div>
+                                </td>
+                              </tr>
+                              {isExpanded && (
+                                <tr>
+                                  <td colSpan={5} className="px-0 py-0">
+                                    <div style={{ background: "#f8fafc", borderTop: "1px solid #e5e7eb", borderBottom: "1px solid #e5e7eb" }}>
+                                      <div className="px-6 py-3">
+                                        <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Top 10 Expenses — {period}</div>
+                                        <div className="space-y-1">
+                                          {topExpenses.map((t, idx) => {
+                                            const maxExp = Math.abs(topExpenses[0]?.amount) || 1;
+                                            const barW = (Math.abs(t.amount) / maxExp) * 100;
+                                            return (
+                                              <div key={idx} className="flex items-center gap-3 py-1.5 group">
+                                                <span className="text-xs text-gray-400 w-5 text-right font-medium">{idx + 1}</span>
+                                                <span className="text-xs text-gray-500 w-20 flex-shrink-0">{t.date}</span>
+                                                <div className="flex-1 min-w-0">
+                                                  <div className="flex items-center gap-2">
+                                                    <span className="text-xs text-gray-700 truncate max-w-xs">{t.description}</span>
+                                                  </div>
+                                                  <div className="h-1 rounded-full bg-gray-200 mt-1 overflow-hidden" style={{ maxWidth: "300px" }}>
+                                                    <div className="h-full rounded-full" style={{ width: `${barW}%`, background: "linear-gradient(90deg, #ef4444, #f87171)" }} />
+                                                  </div>
+                                                </div>
+                                                <span className="text-xs font-semibold text-red-600 w-20 text-right flex-shrink-0">{fmt(Math.abs(t.amount))}</span>
+                                              </div>
+                                            );
+                                          })}
+                                          {topExpenses.length === 0 && (
+                                            <div className="text-xs text-gray-400 py-2">No expenses in this period.</div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
                           );
                         })}
                       </tbody>
