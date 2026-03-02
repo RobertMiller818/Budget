@@ -329,7 +329,16 @@ const CATEGORY_RULES = [
   { name: "Health & Personal", pattern: /cvs|walgreens|pharmacy|doctor|medical|dental|hospital|gym|fitness|haircut|salon|barber/i },
 ];
 
-function categorizeTransaction(desc) {
+const CATEGORY_NAMES = [
+  "Dining & Takeout", "Groceries", "Entertainment & Subscriptions",
+  "Shopping", "Transport & Gas", "Bills & Loans", "Health & Personal", "Other",
+];
+
+function categorizeTransaction(desc, overrides) {
+  if (overrides) {
+    const key = normalizePayee(desc);
+    if (overrides.has(key)) return overrides.get(key);
+  }
   for (const rule of CATEGORY_RULES) {
     if (rule.pattern.test(desc)) return rule.name;
   }
@@ -340,14 +349,14 @@ function categorizeTransaction(desc) {
 // MODEL 1: Spending Category Breakdown & Concentration Risk
 // Identifies which categories consume the most budget and flags over-concentration
 // ═══════════════════════════════════════════════════════════════════════════
-function modelCategoryBreakdown(transactions) {
+function modelCategoryBreakdown(transactions, overrides) {
   const expenses = transactions.filter((t) => t.amount < 0);
   const totalExpenses = expenses.reduce((s, t) => s + Math.abs(t.amount), 0);
   const totalIncome = transactions.filter((t) => t.amount > 0).reduce((s, t) => s + t.amount, 0);
 
   const cats = {};
   expenses.forEach((t) => {
-    const cat = categorizeTransaction(t.description);
+    const cat = categorizeTransaction(t.description, overrides);
     if (!cats[cat]) cats[cat] = { count: 0, total: 0, transactions: [] };
     cats[cat].count++;
     cats[cat].total += Math.abs(t.amount);
@@ -532,7 +541,7 @@ function modelDebtStrategies(cards, monthlyBudget) {
 // MODEL 5: Savings Reallocation Simulator
 // Models what happens if you redirect specific savings into debt payments
 // ═══════════════════════════════════════════════════════════════════════════
-function modelSavingsReallocation(transactions, cards, subscriptions, bills) {
+function modelSavingsReallocation(transactions, cards, subscriptions, bills, overrides) {
   if (!cards.length) return null;
   const expenses = transactions.filter((t) => t.amount < 0);
   const totalExp = expenses.reduce((s, t) => s + Math.abs(t.amount), 0);
@@ -543,7 +552,7 @@ function modelSavingsReallocation(transactions, cards, subscriptions, bills) {
   const subSavings = subscriptions.reduce((s, sub) => s + sub.avgAmount, 0) * 0.5;
 
   // Scenario B: Reduce dining/takeout by 40%
-  const diningCat = modelCategoryBreakdown(transactions).categories.find((c) => c.name === "Dining & Takeout");
+  const diningCat = modelCategoryBreakdown(transactions, overrides).categories.find((c) => c.name === "Dining & Takeout");
   const diningSavings = diningCat ? (diningCat.total / months) * 0.4 : 0;
 
   // Scenario C: Eliminate small impulse purchases (<$15) by 60%
@@ -636,12 +645,12 @@ function modelCashFlowProjection(transactions) {
 // MASTER INSIGHT GENERATOR
 // Runs all models and produces the 3 behavioral + 3 debt recommendations
 // ═══════════════════════════════════════════════════════════════════════════
-function generateInsights(transactions, cards, subscriptions, bills) {
-  const catModel = modelCategoryBreakdown(transactions);
+function generateInsights(transactions, cards, subscriptions, bills, overrides) {
+  const catModel = modelCategoryBreakdown(transactions, overrides);
   const temporalModel = modelTemporalPatterns(transactions);
   const merchantModel = modelMerchantHabits(transactions);
   const debtModel = modelDebtStrategies(cards, 0);
-  const savingsModel = modelSavingsReallocation(transactions, cards, subscriptions, bills);
+  const savingsModel = modelSavingsReallocation(transactions, cards, subscriptions, bills, overrides);
   const cashFlowModel = modelCashFlowProjection(transactions);
 
   // ── BEHAVIORAL INSIGHT 1: Biggest discretionary category to cut ──
@@ -797,14 +806,75 @@ export default function FinancialPlanner() {
   const [budgetView, setBudgetView] = useState("monthly");
   const [parseLog, setParseLog] = useState([]);
   const [expandedPeriods, setExpandedPeriods] = useState(new Set());
+  const [excludedDescriptions, setExcludedDescriptions] = useState(new Set());
+  const [collapsedInsights, setCollapsedInsights] = useState(new Set());
+  const [categoryOverrides, setCategoryOverrides] = useState(new Map());
+  const [recalcKey, setRecalcKey] = useState(0);
+  const [pendingChanges, setPendingChanges] = useState(false);
 
   const { subscriptions, bills } = useMemo(() => detectRecurring(transactions), [transactions]);
   const budget = useMemo(() => buildBudget(transactions), [transactions]);
   const debtPlan = useMemo(() => debtPayoffPlan(cards), [cards]);
-  const insights = useMemo(
-    () => (transactions.length > 0 ? generateInsights(transactions, cards, subscriptions, bills) : null),
-    [transactions, cards, subscriptions, bills]
+
+  // Transactions filtered for behavioral analysis (excluded = mortgage, tuition, etc.)
+  const behavioralTransactions = useMemo(
+    () => transactions.filter((t) => !excludedDescriptions.has(normalizePayee(t.description))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [transactions, excludedDescriptions, recalcKey]
   );
+  const excludedTransactions = useMemo(
+    () => transactions.filter((t) => t.amount < 0 && excludedDescriptions.has(normalizePayee(t.description))),
+    [transactions, excludedDescriptions]
+  );
+  const excludedMonthly = useMemo(() => {
+    const months = new Set(excludedTransactions.map((t) => getMonthKey(t.date)).filter(Boolean)).size || 1;
+    return excludedTransactions.reduce((s, t) => s + Math.abs(t.amount), 0) / months;
+  }, [excludedTransactions]);
+
+  const insights = useMemo(
+    () => (behavioralTransactions.length > 0 ? generateInsights(behavioralTransactions, cards, subscriptions, bills, categoryOverrides) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [behavioralTransactions, cards, subscriptions, bills, categoryOverrides, recalcKey]
+  );
+
+  const toggleExclude = useCallback((description) => {
+    const key = normalizePayee(description);
+    setExcludedDescriptions((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+    setPendingChanges(true);
+  }, []);
+
+  const setCategoryOverride = useCallback((description, category) => {
+    const key = normalizePayee(description);
+    setCategoryOverrides((prev) => {
+      const next = new Map(prev);
+      if (!category || category === "auto") {
+        next.delete(key);
+      } else {
+        next.set(key, category);
+      }
+      return next;
+    });
+    setPendingChanges(true);
+  }, []);
+
+  const recalculate = useCallback(() => {
+    setRecalcKey((k) => k + 1);
+    setPendingChanges(false);
+  }, []);
+
+  const toggleInsightCollapse = useCallback((idx) => {
+    setCollapsedInsights((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
+  }, []);
   const totalSubMonthly = subscriptions.reduce((s, sub) => s + sub.avgAmount, 0);
   const totalBillMonthly = bills.reduce((s, b) => s + b.avgAmount, 0);
 
@@ -1254,7 +1324,7 @@ export default function FinancialPlanner() {
             <div className="max-w-4xl mx-auto space-y-6">
               <div>
                 <h2 style={{ fontFamily: "'Fraunces', serif", fontSize: "1.6rem", fontWeight: 600, color: "#1a1a1a", marginBottom: 4 }}>Smart Insights</h2>
-                <p className="text-sm text-gray-500">Model-driven analysis of your spending patterns and debt situation with actionable recommendations.</p>
+                <p className="text-sm text-gray-500">Model-driven analysis of your spending patterns and debt. Flag fixed obligations (mortgage, tuition) to focus behavioral analysis on changeable spending.</p>
               </div>
 
               {!hasData ? (
@@ -1286,85 +1356,192 @@ export default function FinancialPlanner() {
                     );
                   })()}
 
+                  {/* ── Excluded Fixed Obligations ── */}
+                  {excludedDescriptions.size > 0 && (
+                    <Card className="p-4" style={{ background: "#f0f9ff", borderColor: "#bae6fd" }}>
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-sm">🏠</span>
+                        <div className="text-sm font-semibold text-sky-900">Fixed Obligations (excluded from behavioral analysis)</div>
+                        <div className="ml-auto text-xs text-sky-700 font-medium">{fmt(excludedMonthly)}/mo</div>
+                      </div>
+                      <p className="text-xs text-sky-800 mb-3">These expenses are non-discretionary and excluded from spending pattern recommendations. Mortgage, tuition, and similar obligations should be addressed through refinancing, payment restructuring, or other financial planning strategies — not day-to-day behavioral changes.</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {[...excludedDescriptions].map((desc, i) => {
+                          const matchingTxns = transactions.filter((t) => t.amount < 0 && normalizePayee(t.description) === desc);
+                          const total = matchingTxns.reduce((s, t) => s + Math.abs(t.amount), 0);
+                          const monthsCount = new Set(matchingTxns.map((t) => getMonthKey(t.date)).filter(Boolean)).size || 1;
+                          return (
+                            <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white border border-sky-200 text-xs">
+                              <span className="font-medium text-sky-900 capitalize">{desc}</span>
+                              <span className="text-sky-600">{fmt(total / monthsCount)}/mo</span>
+                              <button onClick={() => toggleExclude(matchingTxns[0]?.description || desc)} className="text-sky-400 hover:text-red-500 ml-1 font-bold">×</button>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* ── Recalculate Bar ── */}
+                  {(pendingChanges || categoryOverrides.size > 0 || excludedDescriptions.size > 0) && (
+                    <Card className="p-3 flex items-center justify-between" style={{ background: pendingChanges ? "#fefce8" : "#f8fafc", borderColor: pendingChanges ? "#fde68a" : "#e2e8f0" }}>
+                      <div className="flex items-center gap-3 text-xs text-gray-600">
+                        {categoryOverrides.size > 0 && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            {categoryOverrides.size} reassigned
+                          </span>
+                        )}
+                        {excludedDescriptions.size > 0 && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200">
+                            {excludedDescriptions.size} flagged
+                          </span>
+                        )}
+                        {pendingChanges && (
+                          <span className="text-amber-700 font-medium">Changes pending — recalculate to update recommendations</span>
+                        )}
+                      </div>
+                      <button
+                        onClick={recalculate}
+                        className="px-4 py-1.5 rounded-lg text-xs font-semibold text-white transition-all hover:scale-105"
+                        style={{ background: pendingChanges ? "linear-gradient(135deg, #1a7a5c, #2d9d78)" : "#9ca3af" }}
+                      >
+                        {pendingChanges ? "⟳ Recalculate" : "✓ Up to date"}
+                      </button>
+                    </Card>
+                  )}
+
                   {/* ── Section: Behavioral Adjustments ── */}
                   <div>
                     <div className="flex items-center gap-2 mb-3">
                       <div className="w-7 h-7 rounded-lg flex items-center justify-center text-sm" style={{ background: "#fef3c7", color: "#92400e" }}>🧠</div>
                       <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: "1.15rem", fontWeight: 600, color: "#1a1a1a" }}>Behavioral Adjustments</h3>
+                      <span className="text-xs text-gray-400 ml-1">Click to expand/collapse</span>
                     </div>
                     <div className="space-y-3">
                       {insights.behavioral.map((insight, i) => {
                         const severityColor = { high: "#dc2626", medium: "#d97706", low: "#059669" }[insight.severity];
+                        const isCollapsed = collapsedInsights.has(`b-${i}`);
                         return (
-                          <Card key={i} className="p-5">
-                            <div className="flex items-start gap-4">
-                              <div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0" style={{ background: "#fefce8" }}>{insight.icon}</div>
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-start justify-between gap-3 mb-1">
-                                  <div className="text-sm font-semibold text-gray-800">{insight.title}</div>
-                                  <div className="text-right flex-shrink-0">
-                                    <div style={{ fontFamily: "'Fraunces', serif", fontSize: "1.1rem", fontWeight: 600, color: severityColor }}>{insight.metric}</div>
-                                    <div className="text-xs text-gray-500">{insight.metricLabel}</div>
+                          <Card key={i} className="overflow-hidden">
+                            {/* Collapsible header */}
+                            <div
+                              className="p-5 cursor-pointer hover:bg-gray-50 transition-colors"
+                              onClick={() => toggleInsightCollapse(`b-${i}`)}
+                            >
+                              <div className="flex items-start gap-4">
+                                <div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0" style={{ background: "#fefce8" }}>
+                                  {insight.icon}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                      <div className="text-sm font-semibold text-gray-800 flex items-center gap-2">
+                                        <span className="text-gray-400 text-xs" style={{ transition: "transform 0.2s", transform: isCollapsed ? "rotate(0deg)" : "rotate(90deg)", display: "inline-block" }}>▶</span>
+                                        {insight.title}
+                                      </div>
+                                      {isCollapsed && <p className="text-xs text-gray-500 mt-0.5 line-clamp-1">{insight.description.substring(0, 80)}...</p>}
+                                    </div>
+                                    <div className="text-right flex-shrink-0">
+                                      <div style={{ fontFamily: "'Fraunces', serif", fontSize: "1.1rem", fontWeight: 600, color: severityColor }}>{insight.metric}</div>
+                                      <div className="text-xs text-gray-500">{insight.metricLabel}</div>
+                                    </div>
                                   </div>
                                 </div>
-                                <p className="text-xs text-gray-600 leading-relaxed mb-3">{insight.description}</p>
-
-                                {/* Savings potential bar */}
-                                {insight.savingsPotential > 0 && (
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-xs text-gray-500 flex-shrink-0">Savings potential:</span>
-                                    <div className="flex-1 h-2 rounded-full bg-gray-100 overflow-hidden" style={{ maxWidth: 200 }}>
-                                      <div className="h-full rounded-full" style={{ width: `${Math.min((insight.savingsPotential / 500) * 100, 100)}%`, background: "linear-gradient(90deg, #059669, #34d399)" }} />
-                                    </div>
-                                    <span className="text-xs font-semibold text-emerald-700 flex-shrink-0">{fmt(insight.savingsPotential)}/mo</span>
-                                  </div>
-                                )}
-
-                                {/* Top merchants detail for behavioral 3 */}
-                                {insight.topMerchants && (
-                                  <div className="mt-3 pt-3 border-t border-gray-100">
-                                    <div className="text-xs font-medium text-gray-500 mb-1.5">Most frequent merchants:</div>
-                                    <div className="flex flex-wrap gap-1.5">
-                                      {insight.topMerchants.map((m, j) => (
-                                        <span key={j} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-50 text-xs text-gray-600">
-                                          <span className="font-medium capitalize">{m.name}</span>
-                                          <span className="text-gray-400">·</span>
-                                          <span>{m.count}x</span>
-                                          <span className="text-gray-400">·</span>
-                                          <span className="text-red-600">{fmt(m.total)}</span>
-                                        </span>
-                                      ))}
-                                    </div>
-                                  </div>
-                                )}
-
-                                {/* Top 10 transactions for this insight */}
-                                {insight.topTransactions && insight.topTransactions.length > 0 && (
-                                  <div className="mt-3 pt-3 border-t border-gray-100">
-                                    <div className="text-xs font-medium text-gray-500 mb-2">Top 10 expenses in this category:</div>
-                                    <div className="space-y-1">
-                                      {insight.topTransactions.map((t, j) => {
-                                        const maxAmt = insight.topTransactions[0]?.amount || 1;
-                                        const barW = (t.amount / maxAmt) * 100;
-                                        return (
-                                          <div key={j} className="flex items-center gap-2 py-1">
-                                            <span className="text-xs text-gray-400 w-4 text-right flex-shrink-0">{j + 1}</span>
-                                            <span className="text-xs text-gray-400 w-20 flex-shrink-0">{t.date}</span>
-                                            <div className="flex-1 min-w-0">
-                                              <div className="text-xs text-gray-700 truncate">{t.description}</div>
-                                              <div className="h-1 rounded-full bg-gray-100 mt-0.5 overflow-hidden" style={{ maxWidth: 220 }}>
-                                                <div className="h-full rounded-full" style={{ width: `${barW}%`, background: "linear-gradient(90deg, #ef4444, #fca5a5)" }} />
-                                              </div>
-                                            </div>
-                                            <span className="text-xs font-semibold text-red-600 w-16 text-right flex-shrink-0">{fmt(t.amount)}</span>
-                                          </div>
-                                        );
-                                      })}
-                                    </div>
-                                  </div>
-                                )}
                               </div>
                             </div>
+
+                            {/* Collapsible body */}
+                            {!isCollapsed && (
+                              <div className="px-5 pb-5 pt-0 ml-15">
+                                <div className="pl-16">
+                                  <p className="text-xs text-gray-600 leading-relaxed mb-3">{insight.description}</p>
+
+                                  {/* Savings potential bar */}
+                                  {insight.savingsPotential > 0 && (
+                                    <div className="flex items-center gap-2 mb-3">
+                                      <span className="text-xs text-gray-500 flex-shrink-0">Savings potential:</span>
+                                      <div className="flex-1 h-2 rounded-full bg-gray-100 overflow-hidden" style={{ maxWidth: 200 }}>
+                                        <div className="h-full rounded-full" style={{ width: `${Math.min((insight.savingsPotential / 500) * 100, 100)}%`, background: "linear-gradient(90deg, #059669, #34d399)" }} />
+                                      </div>
+                                      <span className="text-xs font-semibold text-emerald-700 flex-shrink-0">{fmt(insight.savingsPotential)}/mo</span>
+                                    </div>
+                                  )}
+
+                                  {/* Top merchants */}
+                                  {insight.topMerchants && (
+                                    <div className="mb-3">
+                                      <div className="text-xs font-medium text-gray-500 mb-1.5">Most frequent merchants:</div>
+                                      <div className="flex flex-wrap gap-1.5">
+                                        {insight.topMerchants.map((m, j) => (
+                                          <span key={j} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-50 text-xs text-gray-600">
+                                            <span className="font-medium capitalize">{m.name}</span>
+                                            <span className="text-gray-400">·</span>
+                                            <span>{m.count}x</span>
+                                            <span className="text-gray-400">·</span>
+                                            <span className="text-red-600">{fmt(m.total)}</span>
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Top 10 transactions with category dropdown and exclude buttons */}
+                                  {insight.topTransactions && insight.topTransactions.length > 0 && (
+                                    <div className="pt-3 border-t border-gray-100">
+                                      <div className="text-xs font-medium text-gray-500 mb-2">Top 10 expenses in this category:</div>
+                                      <div className="space-y-0.5">
+                                        {insight.topTransactions.map((t, j) => {
+                                          const maxAmt = insight.topTransactions[0]?.amount || 1;
+                                          const barW = (t.amount / maxAmt) * 100;
+                                          const payeeKey = normalizePayee(t.description);
+                                          const isExcluded = excludedDescriptions.has(payeeKey);
+                                          const currentOverride = categoryOverrides.get(payeeKey) || "";
+                                          const autoCategory = categorizeTransaction(t.description);
+                                          return (
+                                            <div key={j} className="flex items-center gap-1.5 py-1.5 rounded-lg hover:bg-gray-50 px-1 -mx-1" style={{ opacity: isExcluded ? 0.4 : 1 }}>
+                                              <span className="text-xs text-gray-400 w-4 text-right flex-shrink-0">{j + 1}</span>
+                                              <span className="text-xs text-gray-400 w-16 flex-shrink-0">{t.date}</span>
+                                              <div className="flex-1 min-w-0">
+                                                <div className="text-xs text-gray-700 truncate">{t.description}</div>
+                                                <div className="h-1 rounded-full bg-gray-100 mt-0.5 overflow-hidden" style={{ maxWidth: 160 }}>
+                                                  <div className="h-full rounded-full" style={{ width: `${barW}%`, background: "linear-gradient(90deg, #ef4444, #fca5a5)" }} />
+                                                </div>
+                                              </div>
+                                              <span className="text-xs font-semibold text-red-600 w-14 text-right flex-shrink-0">{fmt(t.amount)}</span>
+                                              <select
+                                                value={currentOverride}
+                                                onChange={(e) => { e.stopPropagation(); setCategoryOverride(t.description, e.target.value); }}
+                                                onClick={(e) => e.stopPropagation()}
+                                                className="flex-shrink-0 text-xs rounded border border-gray-200 bg-white px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-emerald-300"
+                                                style={{ maxWidth: 130, color: currentOverride ? "#059669" : "#9ca3af" }}
+                                                title={`Auto-detected: ${autoCategory}. Select to reassign.`}
+                                              >
+                                                <option value="">{autoCategory}</option>
+                                                {CATEGORY_NAMES.filter((c) => c !== autoCategory).map((cat) => (
+                                                  <option key={cat} value={cat}>{cat}</option>
+                                                ))}
+                                              </select>
+                                              <button
+                                                onClick={(e) => { e.stopPropagation(); toggleExclude(t.description); }}
+                                                className="flex-shrink-0 px-1.5 py-0.5 rounded text-xs transition-colors"
+                                                style={{
+                                                  background: isExcluded ? "#dbeafe" : "#f1f5f9",
+                                                  color: isExcluded ? "#1d4ed8" : "#64748b",
+                                                }}
+                                                title={isExcluded ? "Include in behavioral analysis" : "Flag as fixed obligation"}
+                                              >
+                                                {isExcluded ? "✓ Fixed" : "Flag"}
+                                              </button>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                      <div className="text-xs text-gray-400 mt-2 italic">Reassign categories with the dropdown or Flag to exclude fixed obligations.</div>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
                           </Card>
                         );
                       })}
@@ -1378,7 +1555,7 @@ export default function FinancialPlanner() {
                     const catColors = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#3b82f6", "#8b5cf6", "#ec4899", "#6b7280"];
                     return (
                       <Card className="p-5">
-                        <div className="text-sm font-semibold text-gray-800 mb-3">Spending by Category</div>
+                        <div className="text-sm font-semibold text-gray-800 mb-3">Spending by Category (behavioral only)</div>
                         <div className="space-y-2">
                           {cats.map((cat, i) => (
                             <div key={i} className="flex items-center gap-3">
@@ -1425,6 +1602,7 @@ export default function FinancialPlanner() {
                     <div className="flex items-center gap-2 mb-3 mt-2">
                       <div className="w-7 h-7 rounded-lg flex items-center justify-center text-sm" style={{ background: "#fee2e2", color: "#991b1b" }}>💳</div>
                       <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: "1.15rem", fontWeight: 600, color: "#1a1a1a" }}>Debt Payment Strategies</h3>
+                      <span className="text-xs text-gray-400 ml-1">Click to expand/collapse</span>
                     </div>
                     {cards.length === 0 ? (
                       <Card className="p-6 text-center text-gray-400 text-sm">Add credit card debts on the Import tab to see debt strategies.</Card>
@@ -1432,82 +1610,100 @@ export default function FinancialPlanner() {
                       <div className="space-y-3">
                         {insights.debt.map((insight, i) => {
                           const severityColor = { high: "#dc2626", medium: "#d97706", low: "#059669" }[insight.severity];
+                          const isCollapsed = collapsedInsights.has(`d-${i}`);
                           return (
-                            <Card key={i} className="p-5">
-                              <div className="flex items-start gap-4">
-                                <div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0" style={{ background: "#fef2f2" }}>{insight.icon}</div>
-                                <div className="flex-1 min-w-0">
-                                  <div className="flex items-start justify-between gap-3 mb-1">
-                                    <div className="text-sm font-semibold text-gray-800">{insight.title}</div>
-                                    <div className="text-right flex-shrink-0">
-                                      <div style={{ fontFamily: "'Fraunces', serif", fontSize: "1.1rem", fontWeight: 600, color: severityColor }}>{insight.metric}</div>
-                                      <div className="text-xs text-gray-500">{insight.metricLabel}</div>
+                            <Card key={i} className="overflow-hidden">
+                              {/* Collapsible header */}
+                              <div
+                                className="p-5 cursor-pointer hover:bg-gray-50 transition-colors"
+                                onClick={() => toggleInsightCollapse(`d-${i}`)}
+                              >
+                                <div className="flex items-start gap-4">
+                                  <div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0" style={{ background: "#fef2f2" }}>{insight.icon}</div>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-start justify-between gap-3">
+                                      <div>
+                                        <div className="text-sm font-semibold text-gray-800 flex items-center gap-2">
+                                          <span className="text-gray-400 text-xs" style={{ transition: "transform 0.2s", transform: isCollapsed ? "rotate(0deg)" : "rotate(90deg)", display: "inline-block" }}>▶</span>
+                                          {insight.title}
+                                        </div>
+                                        {isCollapsed && <p className="text-xs text-gray-500 mt-0.5 line-clamp-1">{insight.description.substring(0, 80)}...</p>}
+                                      </div>
+                                      <div className="text-right flex-shrink-0">
+                                        <div style={{ fontFamily: "'Fraunces', serif", fontSize: "1.1rem", fontWeight: 600, color: severityColor }}>{insight.metric}</div>
+                                        <div className="text-xs text-gray-500">{insight.metricLabel}</div>
+                                      </div>
                                     </div>
                                   </div>
-                                  <p className="text-xs text-gray-600 leading-relaxed mb-3">{insight.description}</p>
-
-                                  {/* Strategy comparison table */}
-                                  {insight.comparison && (
-                                    <div className="mt-3 pt-3 border-t border-gray-100">
-                                      <div className="text-xs font-medium text-gray-500 mb-2">Strategy Comparison:</div>
-                                      <div className="grid grid-cols-4 gap-2">
-                                        {[
-                                          { name: "Min. Only", data: insight.comparison.baseline, color: "#9ca3af" },
-                                          { name: "Avalanche", data: insight.comparison.avalanche, color: "#059669" },
-                                          { name: "Snowball", data: insight.comparison.snowball, color: "#3b82f6" },
-                                          { name: "Hybrid", data: insight.comparison.hybrid, color: "#8b5cf6" },
-                                        ].map((s, j) => (
-                                          <div key={j} className="rounded-lg p-2.5 text-center" style={{ background: s.color + "10", border: `1px solid ${s.color}30` }}>
-                                            <div className="text-xs font-semibold" style={{ color: s.color }}>{s.name}</div>
-                                            <div className="text-sm font-bold text-gray-800 mt-1">{s.data.months < 600 ? `${s.data.months}mo` : "Never"}</div>
-                                            <div className="text-xs text-gray-500">{s.data.months < 600 ? fmt(s.data.totalInterest) : "∞"} int.</div>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {/* Savings scenarios */}
-                                  {insight.scenarios && (
-                                    <div className="mt-3 pt-3 border-t border-gray-100">
-                                      <div className="text-xs font-medium text-gray-500 mb-2">Reallocation breakdown:</div>
-                                      <div className="space-y-1.5">
-                                        {insight.scenarios.map((s, j) => (
-                                          <div key={j} className="flex items-center gap-2">
-                                            <div className="flex-1 text-xs text-gray-600">{s.name}</div>
-                                            <div className="w-24 h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                                              <div className="h-full rounded-full bg-emerald-400" style={{ width: `${Math.min((s.monthlySavings / 200) * 100, 100)}%` }} />
-                                            </div>
-                                            <div className="text-xs font-semibold text-emerald-700 w-16 text-right">{fmt(s.monthlySavings)}</div>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {/* Cash flow projection */}
-                                  {insight.cashFlow && (
-                                    <div className="mt-3 pt-3 border-t border-gray-100">
-                                      <div className="text-xs font-medium text-gray-500 mb-2">6-month projection at current rate:</div>
-                                      <div className="flex items-end gap-1" style={{ height: 50 }}>
-                                        {insight.cashFlow.projection.map((p, j) => {
-                                          const maxAbs = Math.max(...insight.cashFlow.projection.map((pp) => Math.abs(pp.balance))) || 1;
-                                          const h = (Math.abs(p.balance) / maxAbs) * 100;
-                                          return (
-                                            <div key={j} className="flex-1 flex flex-col items-center justify-end h-full">
-                                              <div className="w-full rounded-t" style={{
-                                                height: `${Math.max(h, 5)}%`,
-                                                background: p.balance >= 0 ? "#34d399" : "#f87171",
-                                              }} />
-                                              <div className="text-xs text-gray-400 mt-1">M{p.month}</div>
-                                            </div>
-                                          );
-                                        })}
-                                      </div>
-                                    </div>
-                                  )}
                                 </div>
                               </div>
+
+                              {/* Collapsible body */}
+                              {!isCollapsed && (
+                                <div className="px-5 pb-5 pt-0">
+                                  <div className="pl-16">
+                                    <p className="text-xs text-gray-600 leading-relaxed mb-3">{insight.description}</p>
+
+                                    {/* Strategy comparison table */}
+                                    {insight.comparison && (
+                                      <div className="pt-3 border-t border-gray-100 mb-3">
+                                        <div className="text-xs font-medium text-gray-500 mb-2">Strategy Comparison:</div>
+                                        <div className="grid grid-cols-4 gap-2">
+                                          {[
+                                            { name: "Min. Only", data: insight.comparison.baseline, color: "#9ca3af" },
+                                            { name: "Avalanche", data: insight.comparison.avalanche, color: "#059669" },
+                                            { name: "Snowball", data: insight.comparison.snowball, color: "#3b82f6" },
+                                            { name: "Hybrid", data: insight.comparison.hybrid, color: "#8b5cf6" },
+                                          ].map((s, j) => (
+                                            <div key={j} className="rounded-lg p-2.5 text-center" style={{ background: s.color + "10", border: `1px solid ${s.color}30` }}>
+                                              <div className="text-xs font-semibold" style={{ color: s.color }}>{s.name}</div>
+                                              <div className="text-sm font-bold text-gray-800 mt-1">{s.data.months < 600 ? `${s.data.months}mo` : "Never"}</div>
+                                              <div className="text-xs text-gray-500">{s.data.months < 600 ? fmt(s.data.totalInterest) : "∞"} int.</div>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Savings scenarios */}
+                                    {insight.scenarios && (
+                                      <div className="pt-3 border-t border-gray-100 mb-3">
+                                        <div className="text-xs font-medium text-gray-500 mb-2">Reallocation breakdown:</div>
+                                        <div className="space-y-1.5">
+                                          {insight.scenarios.map((s, j) => (
+                                            <div key={j} className="flex items-center gap-2">
+                                              <div className="flex-1 text-xs text-gray-600">{s.name}</div>
+                                              <div className="w-24 h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                                                <div className="h-full rounded-full bg-emerald-400" style={{ width: `${Math.min((s.monthlySavings / 200) * 100, 100)}%` }} />
+                                              </div>
+                                              <div className="text-xs font-semibold text-emerald-700 w-16 text-right">{fmt(s.monthlySavings)}</div>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Cash flow projection */}
+                                    {insight.cashFlow && (
+                                      <div className="pt-3 border-t border-gray-100">
+                                        <div className="text-xs font-medium text-gray-500 mb-2">6-month projection at current rate:</div>
+                                        <div className="flex items-end gap-1" style={{ height: 50 }}>
+                                          {insight.cashFlow.projection.map((p, j) => {
+                                            const maxAbs = Math.max(...insight.cashFlow.projection.map((pp) => Math.abs(pp.balance))) || 1;
+                                            const h = (Math.abs(p.balance) / maxAbs) * 100;
+                                            return (
+                                              <div key={j} className="flex-1 flex flex-col items-center justify-end h-full">
+                                                <div className="w-full rounded-t" style={{ height: `${Math.max(h, 5)}%`, background: p.balance >= 0 ? "#34d399" : "#f87171" }} />
+                                                <div className="text-xs text-gray-400 mt-1">M{p.month}</div>
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
                             </Card>
                           );
                         })}
@@ -1527,6 +1723,7 @@ export default function FinancialPlanner() {
                             <p className="text-xs text-emerald-800 mt-1">
                               Implementing all three behavioral changes could save up to <strong>{fmt(totalBehavioralSavings)}/month</strong> ({fmt(totalBehavioralSavings * 12)}/year).
                               {cards.length > 0 && ` Redirecting this to debt would accelerate your payoff significantly.`}
+                              {excludedDescriptions.size > 0 && ` (Excludes ${excludedDescriptions.size} fixed obligation${excludedDescriptions.size > 1 ? "s" : ""} totaling ${fmt(excludedMonthly)}/mo.)`}
                             </p>
                           </div>
                         </div>
